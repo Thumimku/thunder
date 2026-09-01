@@ -17,9 +17,12 @@ import (
 	"github.com/thunder-id/thunderid/internal/application/model"
 	"github.com/thunder-id/thunderid/internal/cert"
 	inboundmodel "github.com/thunder-id/thunderid/internal/inboundclient/model"
+	oauthconfig "github.com/thunder-id/thunderid/internal/oauth/config"
+	"github.com/thunder-id/thunderid/internal/oauth/oauth2/constants"
 	oauthutils "github.com/thunder-id/thunderid/internal/oauth/oauth2/utils"
 	"github.com/thunder-id/thunderid/internal/ou"
 	i18nmgt "github.com/thunder-id/thunderid/internal/system/i18n/mgt"
+	"github.com/thunder-id/thunderid/internal/system/jose/jwt"
 	"github.com/thunder-id/thunderid/internal/system/log"
 	sysutils "github.com/thunder-id/thunderid/internal/system/utils"
 )
@@ -29,6 +32,17 @@ type DCRServiceInterface interface {
 	RegisterClient(
 		ctx context.Context, request *DCRRegistrationRequest,
 	) (*DCRRegistrationResponse, *tidcommon.ServiceError)
+	// GetClient returns the current registration of a dynamically registered client (RFC 7592).
+	GetClient(ctx context.Context, clientID string) (*DCRRegistrationResponse, *tidcommon.ServiceError)
+	// UpdateClient replaces the registered metadata of a client, preserving its client_id (RFC 7592).
+	UpdateClient(ctx context.Context, clientID string, request *DCRRegistrationRequest) (
+		*DCRRegistrationResponse, *tidcommon.ServiceError)
+	// DeleteClient removes a dynamically registered client (RFC 7592).
+	DeleteClient(ctx context.Context, clientID string) *tidcommon.ServiceError
+	// IssueRegistrationAccessToken mints the registration access token bound to clientID.
+	IssueRegistrationAccessToken(ctx context.Context, clientID string) (string, *tidcommon.ServiceError)
+	// ValidateRegistrationAccessToken verifies token and reports whether it may manage clientID.
+	ValidateRegistrationAccessToken(ctx context.Context, token, clientID string) *tidcommon.ServiceError
 }
 
 // dcrService is the default implementation of DCRServiceInterface.
@@ -37,6 +51,8 @@ type dcrService struct {
 	ouService     ou.OrganizationUnitServiceInterface
 	i18nService   i18nmgt.I18nServiceInterface
 	transactioner providers.Transactioner
+	jwtService    jwt.JWTServiceInterface
+	cfg           oauthconfig.Config
 }
 
 // newDCRService creates a new instance of dcrService.
@@ -45,13 +61,22 @@ func newDCRService(
 	ouService ou.OrganizationUnitServiceInterface,
 	i18nService i18nmgt.I18nServiceInterface,
 	transactioner providers.Transactioner,
+	jwtService jwt.JWTServiceInterface,
+	cfg oauthconfig.Config,
 ) DCRServiceInterface {
 	return &dcrService{
 		appService:    appService,
 		ouService:     ouService,
 		i18nService:   i18nService,
 		transactioner: transactioner,
+		jwtService:    jwtService,
+		cfg:           cfg,
 	}
+}
+
+// registrationClientURI builds the RFC 7592 client configuration endpoint URI for clientID.
+func (ds *dcrService) registrationClientURI(clientID string) string {
+	return ds.cfg.BaseURL + constants.OAuth2DCRClientConfigEndpoint + clientID
 }
 
 // RegisterClient registers a new OAuth client using Dynamic Client Registration.
@@ -168,6 +193,297 @@ func (ds *dcrService) RegisterClient(ctx context.Context, request *DCRRegistrati
 	response.LocalizedTosURI = request.LocalizedTosURI
 	response.LocalizedPolicyURI = request.LocalizedPolicyURI
 
+	// Issue the RFC 7592 registration access token so the client can manage its own registration.
+	registrationAccessToken, ratErr := ds.IssueRegistrationAccessToken(ctx, response.ClientID)
+	if ratErr != nil {
+		logger.Error(ctx, "Failed to issue registration access token for DCR client",
+			log.String("appID", createdAppID))
+		return nil, ratErr
+	}
+	response.RegistrationAccessToken = registrationAccessToken
+	response.RegistrationClientURI = ds.registrationClientURI(response.ClientID)
+	response.ClientIDIssuedAt = time.Now().Unix()
+
+	return response, nil
+}
+
+// IssueRegistrationAccessToken mints a registration access token bound to clientID. The token is a
+// signed JWT whose "sub" is the client_id and whose audience is that client's configuration
+// endpoint, so it authorizes management of exactly one registration. The dedicated "typ" header
+// keeps it structurally distinct from an access token, so neither can be replayed as the other.
+func (ds *dcrService) IssueRegistrationAccessToken(ctx context.Context, clientID string) (
+	string, *tidcommon.ServiceError) {
+	if clientID == "" {
+		return "", &ErrorServerError
+	}
+	claims := map[string]interface{}{
+		"aud": ds.registrationClientURI(clientID),
+	}
+	token, _, svcErr := ds.jwtService.GenerateJWT(ctx, clientID, ds.cfg.JWT.Issuer,
+		ds.cfg.OAuth.DCR.RegistrationAccessTokenValidityPeriod, claims, registrationAccessTokenType, "")
+	if svcErr != nil {
+		return "", &ErrorServerError
+	}
+	return token, nil
+}
+
+// ValidateRegistrationAccessToken verifies a registration access token and reports whether it may
+// manage clientID. The token is validated independently of the OAuth token validator: it must carry
+// the registration token type, verify against the server key for this client's configuration
+// endpoint audience, and name clientID as its subject.
+func (ds *dcrService) ValidateRegistrationAccessToken(
+	ctx context.Context, token, clientID string) *tidcommon.ServiceError {
+	if token == "" || clientID == "" {
+		return &ErrorInvalidRegistrationAccessToken
+	}
+
+	header, err := jwt.DecodeJWTHeader(token)
+	if err != nil {
+		return &ErrorInvalidRegistrationAccessToken
+	}
+	if typ, _ := header["typ"].(string); typ != registrationAccessTokenType {
+		return &ErrorInvalidRegistrationAccessToken
+	}
+
+	// Verify the signature, expiry and issuer. The audience is not asserted here so that a token
+	// issued for a different client is rejected as forbidden by the subject check below, rather
+	// than being reported as a malformed token.
+	if svcErr := ds.jwtService.VerifyJWT(ctx, token, "", ds.cfg.JWT.Issuer); svcErr != nil {
+		return &ErrorInvalidRegistrationAccessToken
+	}
+
+	claims, err := jwt.DecodeJWTPayload(token)
+	if err != nil {
+		return &ErrorInvalidRegistrationAccessToken
+	}
+	// The subject binds the token to exactly one registration, so a token minted for another
+	// client cannot manage this one.
+	if sub, _ := claims["sub"].(string); sub != clientID {
+		return &ErrorForbiddenRegistrationAccessToken
+	}
+	return nil
+}
+
+// resolveClient looks up a registered client by client ID, returning both the OAuth client and the
+// application that carries its human-readable metadata. A deleted or unknown client resolves to
+// ErrorClientNotFound, which is what makes a registration access token inert once its client is
+// gone.
+func (ds *dcrService) resolveClient(ctx context.Context, clientID string) (
+	*providers.OAuthClient, *providers.Application, *tidcommon.ServiceError) {
+	logger := log.GetLogger().With(log.String(log.LoggerKeyComponentName, "DCRService"))
+
+	oauthClient, svcErr := ds.appService.GetOAuthApplication(ctx, clientID)
+	if svcErr != nil {
+		if svcErr.Type == tidcommon.ServerErrorType {
+			logger.Error(ctx, "Failed to retrieve OAuth application for client configuration request",
+				log.String("error_code", svcErr.Code))
+			return nil, nil, &ErrorServerError
+		}
+		return nil, nil, &ErrorClientNotFound
+	}
+
+	app, svcErr := ds.appService.GetApplication(ctx, oauthClient.ID)
+	if svcErr != nil {
+		if svcErr.Type == tidcommon.ServerErrorType {
+			logger.Error(ctx, "Failed to retrieve application for client configuration request",
+				log.String("error_code", svcErr.Code))
+			return nil, nil, &ErrorServerError
+		}
+		return nil, nil, &ErrorClientNotFound
+	}
+
+	return oauthClient, app, nil
+}
+
+// GetClient returns the current registration of a dynamically registered client.
+func (ds *dcrService) GetClient(ctx context.Context, clientID string) (
+	*DCRRegistrationResponse, *tidcommon.ServiceError) {
+	oauthClient, app, svcErr := ds.resolveClient(ctx, clientID)
+	if svcErr != nil {
+		return nil, svcErr
+	}
+	return ds.buildClientConfigurationResponse(ctx, oauthClient, app)
+}
+
+// DeleteClient removes a dynamically registered client. Once deleted, the client's registration
+// access token no longer resolves to a client and is therefore unusable.
+func (ds *dcrService) DeleteClient(ctx context.Context, clientID string) *tidcommon.ServiceError {
+	logger := log.GetLogger().With(log.String(log.LoggerKeyComponentName, "DCRService"))
+
+	oauthClient, _, svcErr := ds.resolveClient(ctx, clientID)
+	if svcErr != nil {
+		return svcErr
+	}
+
+	if delErr := ds.appService.DeleteApplication(ctx, oauthClient.ID); delErr != nil {
+		if delErr.Type == tidcommon.ServerErrorType {
+			logger.Error(ctx, "Failed to delete application for client configuration request",
+				log.String("error_code", delErr.Code))
+			return &ErrorServerError
+		}
+		return ds.mapApplicationErrorToDCRError(delErr)
+	}
+	return nil
+}
+
+// UpdateClient replaces the registered metadata of a client. Per RFC 7592 the update is a full
+// replacement of the client metadata, but the client_id and client_secret are preserved.
+func (ds *dcrService) UpdateClient(ctx context.Context, clientID string, request *DCRRegistrationRequest) (
+	*DCRRegistrationResponse, *tidcommon.ServiceError) {
+	logger := log.GetLogger().With(log.String(log.LoggerKeyComponentName, "DCRService"))
+
+	if request == nil {
+		return nil, &ErrorInvalidRequestFormat
+	}
+	if request.JWKSUri != "" && len(request.JWKS) > 0 {
+		return nil, &ErrorJWKSConfigurationConflict
+	}
+	if request.JWKSUri != "" {
+		parsedJWKSURI, err := sysutils.ParseURL(request.JWKSUri)
+		if err != nil || parsedJWKSURI.Scheme != "https" || parsedJWKSURI.Host == "" {
+			return nil, &ErrorInvalidClientMetadata
+		}
+	}
+
+	oauthClient, app, svcErr := ds.resolveClient(ctx, clientID)
+	if svcErr != nil {
+		return nil, svcErr
+	}
+
+	appDTO, svcErr := ds.convertDCRToApplication(request)
+	if svcErr != nil {
+		logger.Error(ctx, "Failed to convert client configuration request to application DTO",
+			log.String("error", svcErr.Error.DefaultValue))
+		return nil, &ErrorServerError
+	}
+
+	// Carry forward the identity of the existing registration. UpdateApplication replaces the
+	// application wholesale, so anything not restored here would be lost: an omitted client ID is
+	// regenerated (dropping the OAuth-app certificate), an omitted OU or name fails validation,
+	// and an empty client secret is what preserves the existing one.
+	appDTO.ID = app.ID
+	appDTO.OUID = app.OUID
+	appDTO.InboundAuthProfile = app.InboundAuthProfile
+	// The application type is immutable; leaving it empty inherits the existing type.
+	appDTO.Type = ""
+	if len(appDTO.InboundAuthConfig) > 0 && appDTO.InboundAuthConfig[0].OAuthConfig != nil {
+		appDTO.InboundAuthConfig[0].OAuthConfig.ClientID = oauthClient.ClientID
+		appDTO.InboundAuthConfig[0].OAuthConfig.ClientSecret = ""
+	}
+	if request.ClientName == "" && len(request.LocalizedClientName) == 0 {
+		appDTO.Name = app.Name
+	}
+
+	updatedApp, updErr := ds.appService.UpdateApplication(ctx, app.ID, appDTO)
+	if updErr != nil {
+		if updErr.Type == tidcommon.ServerErrorType {
+			logger.Error(ctx, "Failed to update application via Application service",
+				log.String("error_code", updErr.Code))
+			return nil, &ErrorServerError
+		}
+		logger.Debug(ctx, "Failed to update application via Application service",
+			log.String("error_code", updErr.Code))
+		return nil, ds.mapApplicationErrorToDCRError(updErr)
+	}
+
+	if writeErr := ds.writeLocalizedVariants(ctx, app.ID, request); writeErr != nil {
+		logger.Error(ctx, "Failed to write localized variants for updated client",
+			log.String("appID", app.ID), log.String("error", writeErr.Error.DefaultValue))
+		return nil, writeErr
+	}
+
+	response, convErr := ds.convertApplicationToDCRResponse(updatedApp, request.ClientName)
+	if convErr != nil {
+		logger.Error(ctx, "Failed to convert updated application to DCR response",
+			log.String("error", convErr.Error.DefaultValue))
+		return nil, convErr
+	}
+
+	// The stored client secret cannot be read back, and this update does not rotate it.
+	response.ClientSecret = ""
+	response.LocalizedClientName = request.LocalizedClientName
+	response.LocalizedLogoURI = request.LocalizedLogoURI
+	response.LocalizedTosURI = request.LocalizedTosURI
+	response.LocalizedPolicyURI = request.LocalizedPolicyURI
+
+	return ds.withClientConfigurationFields(ctx, response)
+}
+
+// buildClientConfigurationResponse renders a registered client as an RFC 7592 client information
+// response. The client secret is deliberately absent: ThunderID stores it write-only, so it cannot
+// be read back after registration.
+func (ds *dcrService) buildClientConfigurationResponse(
+	ctx context.Context, oauthClient *providers.OAuthClient, app *providers.Application) (
+	*DCRRegistrationResponse, *tidcommon.ServiceError) {
+	var jwksURI string
+	var jwks map[string]interface{}
+	if oauthClient.Certificate != nil {
+		switch oauthClient.Certificate.Type {
+		case cert.CertificateTypeJWKSURI:
+			jwksURI = oauthClient.Certificate.Value
+		case cert.CertificateTypeJWKS:
+			if err := json.Unmarshal([]byte(oauthClient.Certificate.Value), &jwks); err != nil {
+				return nil, &ErrorServerError
+			}
+		}
+	}
+
+	var userInfoSignedAlg, userInfoEncryptedAlg, userInfoEncryptedEnc string
+	if oauthClient.UserInfo != nil {
+		userInfoSignedAlg = oauthClient.UserInfo.SigningAlg
+		userInfoEncryptedAlg = oauthClient.UserInfo.EncryptionAlg
+		userInfoEncryptedEnc = oauthClient.UserInfo.EncryptionEnc
+	}
+
+	var idTokenSignedAlg, idTokenEncryptedAlg, idTokenEncryptedEnc string
+	if oauthClient.Token != nil && oauthClient.Token.IDToken != nil {
+		idTokenSignedAlg = oauthClient.Token.IDToken.SigningAlg
+		idTokenEncryptedAlg = oauthClient.Token.IDToken.EncryptionAlg
+		idTokenEncryptedEnc = oauthClient.Token.IDToken.EncryptionEnc
+	}
+
+	response := &DCRRegistrationResponse{
+		ClientID:                           oauthClient.ClientID,
+		ClientSecretExpiresAt:              ClientSecretExpiresAtNever,
+		RedirectURIs:                       oauthClient.RedirectURIs,
+		PostLogoutRedirectURIs:             oauthClient.PostLogoutRedirectURIs,
+		GrantTypes:                         oauthClient.GrantTypes,
+		ResponseTypes:                      oauthClient.ResponseTypes,
+		ClientName:                         app.Name,
+		ClientURI:                          app.URL,
+		LogoURI:                            app.LogoURL,
+		TokenEndpointAuthMethod:            oauthClient.TokenEndpointAuthMethod,
+		JWKSUri:                            jwksURI,
+		JWKS:                               jwks,
+		Scope:                              strings.Join(oauthClient.Scopes, " "),
+		TosURI:                             app.TosURI,
+		PolicyURI:                          app.PolicyURI,
+		Contacts:                           app.Contacts,
+		AppID:                              app.ID,
+		RequirePushedAuthorizationRequests: oauthClient.RequirePushedAuthorizationRequests,
+		DPoPBoundAccessTokens:              oauthClient.DPoPBoundAccessTokens,
+		UserInfoSignedResponseAlg:          userInfoSignedAlg,
+		UserInfoEncryptedResponseAlg:       userInfoEncryptedAlg,
+		UserInfoEncryptedResponseEnc:       userInfoEncryptedEnc,
+		IDTokenSignedResponseAlg:           idTokenSignedAlg,
+		IDTokenEncryptedResponseAlg:        idTokenEncryptedAlg,
+		IDTokenEncryptedResponseEnc:        idTokenEncryptedEnc,
+	}
+
+	return ds.withClientConfigurationFields(ctx, response)
+}
+
+// withClientConfigurationFields attaches the RFC 7592 registration access token and client
+// configuration URI to a client information response.
+func (ds *dcrService) withClientConfigurationFields(
+	ctx context.Context, response *DCRRegistrationResponse) (
+	*DCRRegistrationResponse, *tidcommon.ServiceError) {
+	registrationAccessToken, ratErr := ds.IssueRegistrationAccessToken(ctx, response.ClientID)
+	if ratErr != nil {
+		return nil, ratErr
+	}
+	response.RegistrationAccessToken = registrationAccessToken
+	response.RegistrationClientURI = ds.registrationClientURI(response.ClientID)
 	return response, nil
 }
 
@@ -482,7 +798,7 @@ func (ds *dcrService) mapApplicationErrorToDCRError(
 	case "APP-1012":
 		dcrErr.Code = ErrorInvalidRedirectURI.Code
 	// Server errors
-	case "APP-5001", "APP-5002":
+	case tidcommon.InternalServerError.Code, tidcommon.ErrorEncodingError.Code:
 		dcrErr.Code = ErrorServerError.Code
 	// Default fallback for all other client errors
 	default:

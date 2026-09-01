@@ -6,6 +6,14 @@
     "mockery",
     "oidc",
     "oauth",
-    "streamable"
+    "streamable",
+    "conformance",
+    "truststore",
+    "keytool",
+    "emobix",
+    "htmlunit",
+    "pkce",
+    "jwks",
+    "getent"
   ]
 }

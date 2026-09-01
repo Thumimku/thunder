@@ -11,11 +11,13 @@ import (
 	"maps"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
 	flowcm "github.com/thunder-id/thunderid/internal/flow/common"
 	"github.com/thunder-id/thunderid/internal/flow/flowexec"
+	flowsession "github.com/thunder-id/thunderid/internal/flow/session"
 	oauthconfig "github.com/thunder-id/thunderid/internal/oauth/config"
 	"github.com/thunder-id/thunderid/internal/oauth/oauth2/authz/requestvalidator"
 	oauth2const "github.com/thunder-id/thunderid/internal/oauth/oauth2/constants"
@@ -53,7 +55,13 @@ type authorizeService struct {
 	flowExecService flowexec.FlowExecServiceInterface
 	transactioner   providers.Transactioner
 	criteriaRevoker revocation.CriteriaRevokerInterface
-	logger          *log.Logger
+	// ssoSession resolves an existing SSO session so prompt=none can be answered from it, and
+	// flowProvider supplies the client's authentication flow, whose id names the session's cookie
+	// and whose active version the session must match. Both are nil in deployments without a
+	// session store (the embedded engine), where prompt=none keeps answering login_required.
+	ssoSession   flowsession.Service
+	flowProvider providers.FlowProvider
+	logger       *log.Logger
 }
 
 // newAuthorizeService creates a new instance of authorizeService with injected dependencies.
@@ -67,6 +75,8 @@ func newAuthorizeService(
 	parService par.PARServiceInterface,
 	transactioner providers.Transactioner,
 	criteriaRevoker revocation.CriteriaRevokerInterface,
+	ssoSession flowsession.Service,
+	flowProvider providers.FlowProvider,
 	cfg oauthconfig.Config,
 ) AuthorizeServiceInterface {
 	return &authorizeService{
@@ -81,8 +91,109 @@ func newAuthorizeService(
 		flowExecService: flowExecService,
 		transactioner:   transactioner,
 		criteriaRevoker: criteriaRevoker,
+		ssoSession:      ssoSession,
+		flowProvider:    flowProvider,
 		logger:          log.GetLogger().With(log.String(log.LoggerKeyComponentName, "AuthorizeService")),
 	}
+}
+
+// checkPromptNone decides whether a prompt=none request can be answered without interaction,
+// returning an empty error code when it can (including when prompt=none was not requested).
+//
+// Per OIDC Core 3.1.2.1 the request succeeds only when the End-User is already authenticated, so
+// all three conditions must hold: a live SSO session exists, it belongs to the subject named by
+// id_token_hint when one is supplied, and its authentication satisfies max_age. Any failure is
+// login_required — the specification's answer for "authentication is needed but cannot be asked
+// for".
+func (as *authorizeService) checkPromptNone(
+	ctx context.Context, oauthParams *oauth2model.OAuthParameters, app *providers.OAuthClient,
+) (string, string) {
+	if !slices.Contains(strings.Fields(oauthParams.Prompt), oauth2const.PromptNone) {
+		return "", ""
+	}
+
+	sess := as.resolveSSOSession(ctx, app)
+	if sess == nil {
+		return oauth2const.ErrorLoginRequired, "User authentication is required"
+	}
+
+	if hint := oauthParams.IDTokenHint; hint != "" {
+		subject, err := as.subjectFromIDTokenHint(ctx, hint)
+		if err != nil {
+			return oauth2const.ErrorInvalidRequest, "Invalid id_token_hint"
+		}
+		if subject != sess.SubjectID {
+			// A hint naming someone other than the signed-in subject cannot be satisfied silently.
+			return oauth2const.ErrorLoginRequired,
+				"The session does not belong to the subject named by id_token_hint"
+		}
+	}
+
+	if oauthParams.MaxAge != "" {
+		maxAge, err := strconv.ParseInt(oauthParams.MaxAge, 10, 64)
+		// A malformed max_age is no constraint, matching how the flow's assurance check reads it.
+		if err == nil && maxAge >= 0 &&
+			time.Now().UTC().Unix()-sess.AuthenticatedAt.Unix() > maxAge {
+			return oauth2const.ErrorLoginRequired,
+				"The existing authentication is older than the requested max_age"
+		}
+	}
+
+	return "", ""
+}
+
+// subjectFromIDTokenHint verifies the hint was issued by this server and returns its subject. The
+// token's expiry is deliberately not enforced: the hint identifies who was authenticated, and OIDC
+// Core requires it to be accepted even once expired.
+func (as *authorizeService) subjectFromIDTokenHint(ctx context.Context, idTokenHint string) (string, error) {
+	if svcErr := as.jwtService.VerifyJWTSignature(ctx, idTokenHint); svcErr != nil {
+		return "", errors.New("id_token_hint signature is not valid")
+	}
+	payload, err := jwt.DecodeJWTPayload(idTokenHint)
+	if err != nil {
+		return "", errors.New("id_token_hint could not be decoded")
+	}
+	if iss, _ := payload[oauth2const.ClaimIss].(string); iss != as.cfg.JWT.Issuer {
+		return "", errors.New("id_token_hint was not issued by this server")
+	}
+	subject, _ := payload[oauth2const.ClaimSub].(string)
+	if subject == "" {
+		return "", errors.New("id_token_hint carries no subject")
+	}
+	return subject, nil
+}
+
+// resolveSSOSession returns the live SSO session backing this request's client, or nil when there
+// is none. The handle is carried on a per-flow cookie, so the client's authentication flow has to
+// be resolved before the right cookie can be selected.
+func (as *authorizeService) resolveSSOSession(
+	ctx context.Context, app *providers.OAuthClient,
+) *flowsession.Session {
+	if as.ssoSession == nil || as.flowProvider == nil {
+		return nil
+	}
+	inbound, ok := flowsession.InboundFrom(ctx)
+	if !ok {
+		return nil
+	}
+
+	client, svcErr := as.inboundClient.GetInboundClientByID(ctx, app.ID)
+	if svcErr != nil || client == nil || client.AuthFlowID == "" {
+		return nil
+	}
+	flow, flowErr := as.flowProvider.GetFlow(ctx, client.AuthFlowID)
+	if flowErr != nil || flow == nil {
+		return nil
+	}
+
+	handle := inbound.HandleFor(client.AuthFlowID)
+	sess, err := as.ssoSession.Resolve(ctx, handle, client.AuthFlowID, flow.ActiveVersion, time.Now().UTC())
+	if err != nil {
+		as.logger.Debug(ctx, "Failed to resolve the SSO session for the authorization request",
+			log.Error(err))
+		return nil
+	}
+	return sess
 }
 
 // GetAuthorizationCodeDetails retrieves and consumes the authorization code.
@@ -364,6 +475,7 @@ func (as *authorizeService) handleStandardAuthorizationRequest(
 		MaxAge:              maxAge,
 		DPoPJkt:             dpopJkt,
 		Prompt:              prompt,
+		IDTokenHint:         queryParams.Get(oauth2const.RequestParamIDTokenHint),
 	}
 
 	// Set the redirect URI if not provided in the request. Invalid cases are already handled at this point.
@@ -389,6 +501,19 @@ func (as *authorizeService) initiateFlowAndStoreRequest(
 	ctx context.Context, oauthParams *oauth2model.OAuthParameters,
 	app *providers.OAuthClient, initiatorReq *providers.InitiatorRequest,
 ) (*AuthorizationInitResult, *AuthorizationError) {
+	// prompt=none forbids any user interaction, so it can only be honored by an existing session
+	// that also satisfies id_token_hint and max_age. This is checked here, where both the standard
+	// and PAR paths converge, and before the flow starts: the flow would otherwise prompt.
+	if errCode, errMsg := as.checkPromptNone(ctx, oauthParams, app); errCode != "" {
+		return nil, &AuthorizationError{
+			Code:              errCode,
+			Message:           errMsg,
+			SendErrorToClient: oauthParams.RedirectURI != "",
+			ClientRedirectURI: oauthParams.RedirectURI,
+			State:             oauthParams.State,
+		}
+	}
+
 	// Bind the request to a single target resource server before the flow starts. OIDC-only or
 	// scopeless requests stay unbound and their audience is the client_id. A permission-bearing
 	// request resolves an explicit resource or the configured default, rejecting with invalid_target
@@ -460,6 +585,11 @@ func (as *authorizeService) initiateFlowAndStoreRequest(
 	}
 	if slices.Contains(strings.Fields(oauthParams.Prompt), oauth2const.PromptConsent) {
 		runtimeData[flowcm.RuntimeKeyForceConsentReprompt] = "true"
+	}
+	// prompt=login requires a fresh authentication regardless of any existing session (OIDC Core
+	// 3.1.2.1), so tell the SSO-Check node not to reuse one.
+	if slices.Contains(strings.Fields(oauthParams.Prompt), oauth2const.PromptLogin) {
+		runtimeData[flowcm.RuntimeKeyForceReauth] = "true"
 	}
 	if oauthParams.MaxAge != "" {
 		runtimeData[flowcm.RuntimeKeyMaxAge] = oauthParams.MaxAge

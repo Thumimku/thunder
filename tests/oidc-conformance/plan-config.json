@@ -1,0 +1,16 @@
+{
+  "alias": "thunderid-oidc-conformance",
+  "description": "ThunderID OIDC Basic Certification",
+  "server": {
+    "discoveryUrl": "https://THUNDERID_HOST:8090/.well-known/openid-configuration"
+  },
+  "client": {
+    "client_name": "Conformance Suite RP 1",
+    "scope": "openid profile email"
+  },
+  "client2": {
+    "client_name": "Conformance Suite RP 2",
+    "scope": "openid profile email"
+  },
+  "consent": {}
+}

@@ -15,10 +15,23 @@ import (
 const (
 	ClientSecretExpiresAtNever   = 0 // Never expires
 	maxLocalizedVariantsPerField = 20
+
+	// registrationAccessTokenType is the JWT "typ" header of an RFC 7592 registration access token.
+	// It keeps the token structurally distinct from an OAuth access token so neither can be
+	// replayed as the other.
+	registrationAccessTokenType = "registration+jwt" //nolint:gosec // JWT typ header value, not a credential
+
+	authorizationHeaderName   = "Authorization"
+	wwwAuthenticateHeaderName = "WWW-Authenticate"
+	//nolint:gosec // WWW-Authenticate challenge value, not a credential
+	wwwAuthenticateInvalidToken = `Bearer error="invalid_token"`
 )
 
-// DCRRegistrationRequest represents the RFC 7591 Dynamic Client Registration request.
+// DCRRegistrationRequest represents the RFC 7591 Dynamic Client Registration request. It is also
+// the request body of an RFC 7592 client configuration update, where ClientID identifies the client
+// being updated.
 type DCRRegistrationRequest struct {
+	ClientID                string                            `json:"client_id,omitempty"`
 	OUID                    string                            `json:"ou_id,omitempty"`
 	RedirectURIs            []string                          `json:"redirect_uris"`
 	PostLogoutRedirectURIs  []string                          `json:"post_logout_redirect_uris,omitempty"`
@@ -114,10 +127,15 @@ func setLocalizedVariant(m *map[string]string, field, tag, val string) error {
 }
 
 // DCRRegistrationResponse represents the RFC 7591 Dynamic Client Registration response.
+// It also carries the RFC 7592 client configuration fields (registration_access_token,
+// registration_client_uri) returned at registration and by the client configuration endpoint.
 type DCRRegistrationResponse struct {
 	ClientID                string                            `json:"client_id"`
 	ClientSecret            string                            `json:"client_secret,omitempty"`
 	ClientSecretExpiresAt   int64                             `json:"client_secret_expires_at"`
+	ClientIDIssuedAt        int64                             `json:"client_id_issued_at,omitempty"`
+	RegistrationAccessToken string                            `json:"registration_access_token,omitempty"`
+	RegistrationClientURI   string                            `json:"registration_client_uri,omitempty"`
 	RedirectURIs            []string                          `json:"redirect_uris,omitempty"`
 	PostLogoutRedirectURIs  []string                          `json:"post_logout_redirect_uris,omitempty"`
 	GrantTypes              []providers.GrantType             `json:"grant_types,omitempty"`

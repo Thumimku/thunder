@@ -137,7 +137,8 @@
     },
     "dcr": {
       "enabled" : true,
-      "insecure": false
+      "insecure": false,
+      "registration_access_token_validity_period": 7776000
     },
     "par": {
       "require_par": false,

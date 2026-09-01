@@ -203,6 +203,10 @@ type AuthorizationRequestConfig struct {
 type DCRConfig struct {
 	Enabled  *bool `yaml:"enabled" json:"enabled"`
 	Insecure bool  `yaml:"insecure" json:"insecure"`
+	// RegistrationAccessTokenValidityPeriod is how long (in seconds) a registration access token
+	// issued at registration stays valid for managing the client through the RFC 7592 client
+	// configuration endpoint.
+	RegistrationAccessTokenValidityPeriod int64 `yaml:"registration_access_token_validity_period" json:"registration_access_token_validity_period"` //nolint:lll // struct tag cannot be wrapped
 }
 
 // IsEnabled returns whether DCR is enabled, defaulting to false if unset

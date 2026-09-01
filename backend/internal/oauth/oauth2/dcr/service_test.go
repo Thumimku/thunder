@@ -20,14 +20,20 @@ import (
 	i18nmgt "github.com/thunder-id/thunderid/internal/system/i18n/mgt"
 	"github.com/thunder-id/thunderid/tests/mocks/applicationmock"
 	i18nmock "github.com/thunder-id/thunderid/tests/mocks/i18n/mgtmock"
+	"github.com/thunder-id/thunderid/tests/mocks/jose/jwtmock"
 	"github.com/thunder-id/thunderid/tests/mocks/oumock"
+	"github.com/thunder-id/thunderid/tests/testhelpers"
 )
+
+// testRegistrationAccessToken is the registration access token returned by the mocked JWT service.
+const testRegistrationAccessToken = "test-registration-access-token" //nolint:gosec // test fixture
 
 // DCRServiceTestSuite is the test suite for DCR service
 type DCRServiceTestSuite struct {
 	suite.Suite
 	mockAppService *applicationmock.ApplicationServiceInterfaceMock
 	mockOUService  *oumock.OrganizationUnitServiceInterfaceMock
+	mockJWTService *jwtmock.JWTServiceInterfaceMock
 	service        DCRServiceInterface
 }
 
@@ -45,7 +51,14 @@ func (m *MockTransactioner) Transact(ctx context.Context, txFunc func(context.Co
 func (s *DCRServiceTestSuite) SetupTest() {
 	s.mockAppService = applicationmock.NewApplicationServiceInterfaceMock(s.T())
 	s.mockOUService = oumock.NewOrganizationUnitServiceInterfaceMock(s.T())
-	s.service = newDCRService(s.mockAppService, s.mockOUService, nil, &MockTransactioner{})
+	s.mockJWTService = jwtmock.NewJWTServiceInterfaceMock(s.T())
+	// Registration issues a registration access token, so every successful registration reaches
+	// the JWT service. Maybe() keeps the expectation optional for the failure-path tests.
+	s.mockJWTService.On("GenerateJWT", mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+		mock.Anything, mock.Anything, mock.Anything).
+		Return(testRegistrationAccessToken, int64(0), (*tidcommon.ServiceError)(nil)).Maybe()
+	s.service = newDCRService(s.mockAppService, s.mockOUService, nil, &MockTransactioner{},
+		s.mockJWTService, testhelpers.OAuthConfig())
 }
 
 // TestBuildIDTokenConfig verifies that the response type is derived from the algorithm fields, so
@@ -106,7 +119,8 @@ func (s *DCRServiceTestSuite) TestBuildIDTokenConfig() {
 
 // TestNewDCRService tests the service constructor
 func (s *DCRServiceTestSuite) TestNewDCRService() {
-	service := newDCRService(s.mockAppService, s.mockOUService, nil, &MockTransactioner{})
+	service := newDCRService(s.mockAppService, s.mockOUService, nil, &MockTransactioner{},
+		s.mockJWTService, testhelpers.OAuthConfig())
 	s.NotNil(service)
 	s.Implements((*DCRServiceInterface)(nil), service)
 }
@@ -265,13 +279,13 @@ func (s *DCRServiceTestSuite) TestMapApplicationErrorToDCRError() {
 			expectedDCRCode: ErrorInvalidClientMetadata.Code,
 		},
 		{
-			name:            "Server Error APP-5001",
-			appErrCode:      "APP-5001",
+			name:            "Internal Server Error SSE-5000",
+			appErrCode:      tidcommon.InternalServerError.Code,
 			expectedDCRCode: ErrorServerError.Code,
 		},
 		{
-			name:            "Server Error APP-5002",
-			appErrCode:      "APP-5002",
+			name:            "Encoding Error SSE-5001",
+			appErrCode:      tidcommon.ErrorEncodingError.Code,
 			expectedDCRCode: ErrorServerError.Code,
 		},
 		{
@@ -498,7 +512,8 @@ func (s *DCRServiceTestSuite) TestRegisterClient_EmptyInboundAuthConfig() {
 // and that the non-tagged default is stored under SystemLanguage.
 func (s *DCRServiceTestSuite) TestRegisterClient_WithLocalizedVariants() {
 	mockI18n := i18nmock.NewI18nServiceInterfaceMock(s.T())
-	svc := newDCRService(s.mockAppService, s.mockOUService, mockI18n, &MockTransactioner{})
+	svc := newDCRService(s.mockAppService, s.mockOUService, mockI18n, &MockTransactioner{},
+		s.mockJWTService, testhelpers.OAuthConfig())
 
 	request := &DCRRegistrationRequest{
 		OUID:                "test-ou-1",
@@ -553,7 +568,8 @@ func (s *DCRServiceTestSuite) TestRegisterClient_WithLocalizedVariants() {
 // client_name is provided (no localized variants), it is stored under SystemLanguage.
 func (s *DCRServiceTestSuite) TestRegisterClient_DefaultOnlyStoresSystemLanguage() {
 	mockI18n := i18nmock.NewI18nServiceInterfaceMock(s.T())
-	svc := newDCRService(s.mockAppService, s.mockOUService, mockI18n, &MockTransactioner{})
+	svc := newDCRService(s.mockAppService, s.mockOUService, mockI18n, &MockTransactioner{},
+		s.mockJWTService, testhelpers.OAuthConfig())
 
 	request := &DCRRegistrationRequest{
 		OUID:       "test-ou-1",
@@ -598,7 +614,8 @@ func (s *DCRServiceTestSuite) TestRegisterClient_DefaultOnlyStoresSystemLanguage
 // default and an explicit #SystemLanguage-tagged variant are provided, the tagged variant wins.
 func (s *DCRServiceTestSuite) TestRegisterClient_TaggedSystemLanguageWinsOverDefault() {
 	mockI18n := i18nmock.NewI18nServiceInterfaceMock(s.T())
-	svc := newDCRService(s.mockAppService, s.mockOUService, mockI18n, &MockTransactioner{})
+	svc := newDCRService(s.mockAppService, s.mockOUService, mockI18n, &MockTransactioner{},
+		s.mockJWTService, testhelpers.OAuthConfig())
 
 	request := &DCRRegistrationRequest{
 		OUID:                "test-ou-1",
@@ -646,7 +663,8 @@ func (s *DCRServiceTestSuite) TestRegisterClient_TaggedSystemLanguageWinsOverDef
 // partial-row cleanup and app compensation delete.
 func (s *DCRServiceTestSuite) TestRegisterClient_LocalizedVariantsWriteFailure() {
 	mockI18n := i18nmock.NewI18nServiceInterfaceMock(s.T())
-	svc := newDCRService(s.mockAppService, s.mockOUService, mockI18n, &MockTransactioner{})
+	svc := newDCRService(s.mockAppService, s.mockOUService, mockI18n, &MockTransactioner{},
+		s.mockJWTService, testhelpers.OAuthConfig())
 
 	request := &DCRRegistrationRequest{
 		OUID:                "test-ou-1",
@@ -697,7 +715,8 @@ func (s *DCRServiceTestSuite) TestRegisterClient_LocalizedVariantsWriteFailure()
 // validation must return ErrorInvalidClientMetadata and trigger the compensation rollback.
 func (s *DCRServiceTestSuite) TestRegisterClient_InvalidLocalizedURI() {
 	mockI18n := i18nmock.NewI18nServiceInterfaceMock(s.T())
-	svc := newDCRService(s.mockAppService, s.mockOUService, mockI18n, &MockTransactioner{})
+	svc := newDCRService(s.mockAppService, s.mockOUService, mockI18n, &MockTransactioner{},
+		s.mockJWTService, testhelpers.OAuthConfig())
 
 	request := &DCRRegistrationRequest{
 		OUID:             "test-ou-1",
@@ -818,7 +837,8 @@ func (s *DCRServiceTestSuite) TestRegisterClient_WithIDTokenEncryption() {
 // i18n error maps to ErrorServerError to avoid leaking internal details to external callers.
 func (s *DCRServiceTestSuite) TestRegisterClient_LocalizedVariantsWriteFailure_ClientError() {
 	mockI18n := i18nmock.NewI18nServiceInterfaceMock(s.T())
-	svc := newDCRService(s.mockAppService, s.mockOUService, mockI18n, &MockTransactioner{})
+	svc := newDCRService(s.mockAppService, s.mockOUService, mockI18n, &MockTransactioner{},
+		s.mockJWTService, testhelpers.OAuthConfig())
 
 	request := &DCRRegistrationRequest{
 		OUID:                "test-ou-1",

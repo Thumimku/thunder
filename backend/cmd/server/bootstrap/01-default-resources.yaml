@@ -107,7 +107,7 @@ flowType: AUTHENTICATION
 nodes:
 - id: start
   type: START
-  onSuccess: prompt_credentials
+  onSuccess: sso_check
   layout:
     size:
       width: 101
@@ -192,11 +192,38 @@ nodes:
     position:
       x: 562
       y: 312
+- id: sso_check
+  type: TASK_EXECUTION
+  executor:
+    name: SSOCheckExecutor
+  properties:
+    checkpointRef: session
+  onSuccess: session
+  onFailure: prompt_credentials
+  layout:
+    size:
+      width: 200
+      height: 113
+    position:
+      x: 390
+      y: 470
+- id: session
+  type: TASK_EXECUTION
+  executor:
+    name: SessionExecutor
+  onSuccess: authorization_check
+  layout:
+    size:
+      width: 200
+      height: 113
+    position:
+      x: 1530
+      y: 470
 - id: credentials_auth
   type: TASK_EXECUTION
   executor:
     name: CredentialsAuthExecutor
-  onSuccess: authorization_check
+  onSuccess: session
   onIncomplete: prompt_credentials
   layout:
     size:

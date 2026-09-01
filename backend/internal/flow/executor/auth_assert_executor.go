@@ -206,6 +206,11 @@ func (a *authAssertExecutor) generateAuthAssertion(
 		jwtClaims[oauth2const.ClaimCompletedAuthClass] = completedACR
 	}
 
+	// Carry the time the subject actually authenticated. On the SSO path that is the reused
+	// session's authentication time, which is older than this assertion's iat; without the claim
+	// the OAuth layer falls back to iat and auth_time advances on every authorization.
+	jwtClaims[oauth2const.ClaimAuthTime] = a.resolveAuthTime(ctx)
+
 	// Bind the assertion to the originating auth request so the corresponding callback can verify this assertion
 	// authorizes the specific request it accompanies.
 	if authReqID, exists := ctx.RuntimeData[common.RuntimeKeyAuthorizationRequestID]; exists && authReqID != "" {

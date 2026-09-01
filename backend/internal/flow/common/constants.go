@@ -174,6 +174,10 @@ const (
 	// RuntimeKeyForceConsentReprompt indicates that consent must be re-prompted for all required
 	// claims, set when the authorization request includes prompt=consent.
 	RuntimeKeyForceConsentReprompt = "force_consent_reprompt"
+	// RuntimeKeyForceReauth indicates that the subject must authenticate again in this execution
+	// even when a live SSO session exists, set when the authorization request includes
+	// prompt=login. The SSO-Check node honors it by routing to full authentication.
+	RuntimeKeyForceReauth = "force_reauth"
 	// RuntimeKeyStoredInviteToken holds the generated invite token stored during the invite send phase.
 	RuntimeKeyStoredInviteToken = "storedInviteToken"
 	// RuntimeKeyUserAttributesCacheTTLSeconds indicates the TTL of the user attributes cache.

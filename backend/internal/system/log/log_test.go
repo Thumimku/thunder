@@ -13,7 +13,6 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 
 	sysContext "github.com/thunder-id/thunderid/internal/system/context"
@@ -291,10 +290,12 @@ func (suite *LogTestSuite) TestMaskedMap() {
 
 // newContextTestLogger creates a Logger backed by a contextHandler writing to buf.
 func newContextTestLogger(buf *bytes.Buffer) *Logger {
-	levelVar := new(slog.LevelVar)
-	levelVar.Set(slog.LevelDebug)
-	handler := slog.NewTextHandler(buf, &slog.HandlerOptions{Level: levelVar})
-	return newLogger(&contextHandler{Handler: handler}, levelVar, buf, formatText)
+	handlerOptions := &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	}
+	return &Logger{
+		internal: slog.New(&contextHandler{Handler: slog.NewTextHandler(buf, handlerOptions)}),
+	}
 }
 
 func (suite *LogTestSuite) TestContextLogMethodsWithTraceID() {
@@ -374,10 +375,8 @@ func (suite *LogTestSuite) TestGetLoggerUsesContextHandler() {
 	once = sync.Once{}
 
 	log := GetLogger()
-	dynamic, ok := log.internal.Handler().(*dynamicHandler)
-	require.True(suite.T(), ok, "GetLogger should install the dynamic handler")
-	_, ok = dynamic.resolve().(*contextHandler)
-	assert.True(suite.T(), ok, "the resolved handler should be wrapped with contextHandler")
+	_, ok := log.internal.Handler().(*contextHandler)
+	assert.True(suite.T(), ok, "GetLogger should wrap the handler with contextHandler")
 }
 
 func (suite *LogTestSuite) TestServerErrorWriterWrite() {
@@ -401,7 +400,10 @@ func (suite *LogTestSuite) TestServerErrorWriterWrite() {
 func (suite *LogTestSuite) TestServerErrorWriterRespectsLevel() {
 	var buf bytes.Buffer
 	log := newContextTestLogger(&buf)
-	require.NoError(suite.T(), log.SetLevel("error"))
+	log.levelVar = new(slog.LevelVar)
+	log.levelVar.Set(slog.LevelError)
+	log.internal = slog.New(&contextHandler{Handler: slog.NewTextHandler(&buf,
+		&slog.HandlerOptions{Level: log.levelVar})})
 	w := &serverErrorWriter{logger: log}
 
 	_, err := w.Write([]byte("some server error"))
