@@ -8,6 +8,8 @@
 [![codecov.io](https://codecov.io/github/thunder-id/thunderid/coverage.svg?branch=main)](https://codecov.io/github/thunder-id/thunderid?branch=main)
 [![GitHub Release](https://img.shields.io/github/v/release/thunder-id/thunderid?color=blue)](https://github.com/thunder-id/thunderid/releases/latest)
 
+[![OIDC Conformance](https://github.com/thunder-id/thunderid/actions/workflows/oidc-conformance-test.yml/badge.svg)](https://github.com/thunder-id/thunderid/actions/workflows/oidc-conformance-test.yml)
+
 
 ThunderID is a lightweight, open-source IAM stack built to secure access for humans, AI agents, and machines.
 
